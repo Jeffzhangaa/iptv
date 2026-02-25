@@ -2,14 +2,14 @@
 set -e
 
 # ===============================
-# 高级证书管理脚本 V2.5.3
+# 高级证书管理脚本 V2.6
 # ===============================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
-echo -e "${GREEN}=== 高级证书管理脚本 V2.5.3 ===${NC}"
+echo -e "${GREEN}=== 高级证书管理脚本 V2.6 ===${NC}"
 
 # -----------------------------
 # 0️⃣ 依赖安装
@@ -23,7 +23,7 @@ fi
 sudo systemctl enable cron --now || true
 
 ACME_BIN="$HOME/.acme.sh/acme.sh"
-[ ! -f "$ACME_BIN" ] && curl https://get.acme.sh | sh && source "$HOME/.bashrc"
+[ ! -f "$ACME_BIN" ] && curl https://get.acme.sh | sh && ACME_BIN="$HOME/.acme.sh/acme.sh"
 
 # -----------------------------
 # 🔹 端口检测与防火墙处理
@@ -31,9 +31,8 @@ ACME_BIN="$HOME/.acme.sh/acme.sh"
 check_and_open_port(){
     local PORT=$1
     if lsof -iTCP:$PORT -sTCP:LISTEN -t >/dev/null ; then
-        echo -e "${RED}⚠️ 端口 $PORT 已被占用，尝试释放...${NC}"
-        PID=$(lsof -iTCP:$PORT -sTCP:LISTEN -t)
-        kill -9 $PID && echo "✅ 已释放端口 $PORT" || echo "❌ 无法自动释放端口 $PORT，请手动处理"
+        echo -e "${RED}⚠️ 端口 $PORT 已被占用，请手动停止占用服务后再继续${NC}"
+        exit 1
     else
         echo -e "${GREEN}✅ 端口 $PORT 可用${NC}"
     fi
@@ -79,8 +78,9 @@ case $AUTH_MODE in
         ;;
     3)
         read -p "请输入网站根目录路径 (例: /var/www/html): " WEB_PATH
-        check_and_open_port 80
-        check_and_open_port 443
+        if [ ! -d "$WEB_PATH" ]; then
+            echo -e "${RED}❌ Webroot 目录不存在${NC}"; exit 1
+        fi
         ISSUE_CMD="--webroot $WEB_PATH"
         ;;
     *)
@@ -110,7 +110,8 @@ fi
 # 域名输入
 # -----------------------------
 read -p "请输入域名 (逗号分隔，支持泛域名 *.example.com): " DOMAIN_INPUT
-IFS=',' read -ra DOMAINS <<< "$(echo $DOMAIN_INPUT | tr -d ' ')"
+DOMAIN_INPUT=$(echo "$DOMAIN_INPUT" | tr -d ' ')
+IFS=',' read -ra DOMAINS <<< "$DOMAIN_INPUT"
 ACME_DOMAIN_ARGS=""
 for d in "${DOMAINS[@]}"; do ACME_DOMAIN_ARGS="$ACME_DOMAIN_ARGS -d $d"; done
 MAIN_DOMAIN="${DOMAINS[0]}"
@@ -142,17 +143,22 @@ issue_and_install(){
     local MODE=$1
     local KEY_LEN="ec-256"; local ECC_FLAG="--ecc"
     [ "$MODE" = "rsa" ] && KEY_LEN="2048" && ECC_FLAG=""
-    
+
     echo -e "${GREEN}>>> 签发 $MODE 证书...${NC}"
-    
+
     "$ACME_BIN" --issue $ACME_DOMAIN_ARGS --keylength $KEY_LEN $CA_SERVER $ISSUE_CMD
-    
-    RELOAD_ARG=${RELOADCMD:+--reloadcmd "$RELOADCMD"}
+
+    if [ -n "$RELOADCMD" ]; then
+        RELOAD_ARG=(--reloadcmd "$RELOADCMD")
+    else
+        RELOAD_ARG=()
+    fi
+
     "$ACME_BIN" --install-cert -d "$MAIN_DOMAIN" $ECC_FLAG \
         --key-file "$CERT_DIR/private_$MODE.key" \
         --fullchain-file "$CERT_DIR/fullchain_$MODE.crt" \
-        $RELOAD_ARG
-    
+        "${RELOAD_ARG[@]}"
+
     echo -e "${GREEN}✅ $MODE 证书安装完成${NC}"
 }
 
@@ -166,3 +172,80 @@ case $CERT_TYPE_CHOICE in
 esac
 
 echo -e "\n${GREEN}✅ 任务完成！证书已部署在: $CERT_DIR${NC}"
+echo
+echo "======================================"
+echo "🔍 自动续期 & 自动安装状态检测"
+echo "======================================"
+
+NEED_FIX=0
+
+# 自动识别 acme 安装目录（兼容 root / 普通用户）
+if [ -f "/root/.acme.sh/acme.sh" ]; then
+    ACME_HOME="/root/.acme.sh"
+elif [ -f "$HOME/.acme.sh/acme.sh" ]; then
+    ACME_HOME="$HOME/.acme.sh"
+else
+    echo "❌ 未检测到 acme.sh 安装目录"
+    NEED_FIX=1
+fi
+
+ACME_BIN="$ACME_HOME/acme.sh"
+
+# 1️⃣ 检查 cron 任务
+CRON_JOB=$(crontab -l 2>/dev/null | grep acme.sh)
+
+if [ -n "$CRON_JOB" ]; then
+    echo "✅ 已存在自动续期 cron 任务"
+else
+    echo "⚠ 未检测到 cron 自动续期任务，尝试创建..."
+    "$ACME_BIN" --install-cronjob
+    NEED_FIX=1
+fi
+
+# 2️⃣ 检查 install-cert 是否绑定
+if [ -n "$MAIN_DOMAIN" ]; then
+    CONF_FILE="$ACME_HOME/$MAIN_DOMAIN/$MAIN_DOMAIN.conf"
+    if [ -f "$CONF_FILE" ] && grep -q "Le_RealCertPath" "$CONF_FILE"; then
+        echo "✅ 已绑定 install-cert（续期后会自动覆盖证书）"
+    else
+        echo "⚠ 未检测到 install-cert 绑定信息"
+        NEED_FIX=1
+    fi
+fi
+
+# 3️⃣ 检查账户 & DNS API
+ACCOUNT_CONF="$ACME_HOME/account.conf"
+
+if [ -f "$ACCOUNT_CONF" ]; then
+    echo "✅ 已检测到账户配置文件"
+
+    grep -q "CF_Token" "$ACCOUNT_CONF" 2>/dev/null && echo "   ✔ Cloudflare API 已配置"
+    grep -q "Ali_Key" "$ACCOUNT_CONF" 2>/dev/null && echo "   ✔ Aliyun API 已配置"
+    grep -q "GD_Key" "$ACCOUNT_CONF" 2>/dev/null && echo "   ✔ GoDaddy API 已配置"
+    grep -q "ZEROSSL_EMAIL" "$ACCOUNT_CONF" 2>/dev/null && echo "   ✔ ZeroSSL 账户已注册"
+else
+    echo "❌ 未检测到账户配置文件"
+    NEED_FIX=1
+fi
+
+# 4️⃣ 模拟执行续期
+echo
+echo "🔄 模拟执行续期检查..."
+"$ACME_BIN" --cron --home "$ACME_HOME" >/dev/null 2>&1
+
+if [ $? -eq 0 ]; then
+    echo "✅ 自动续期机制运行正常"
+else
+    echo "❌ 自动续期机制运行异常"
+    NEED_FIX=1
+fi
+
+# 5️⃣ 综合结果
+echo
+if [ "$NEED_FIX" -eq 0 ]; then
+    echo "🎉 自动续期系统状态：完全正常"
+else
+    echo "⚠ 自动续期系统存在异常，请根据上方提示检查"
+fi
+
+echo "======================================"
